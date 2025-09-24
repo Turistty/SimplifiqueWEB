@@ -1,0 +1,476 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_NAME="${1:-simplifique}"
+ROOT="$(pwd)/$PROJECT_NAME"
+
+echo ">> Criando estrutura do projeto em: $ROOT"
+
+# Diretórios
+mkdir -p "$ROOT"/backend/app/api/v1/resources
+mkdir -p "$ROOT"/backend/app/api/v1/schemas
+mkdir -p "$ROOT"/backend/app/models
+mkdir -p "$ROOT"/backend/app/services
+mkdir -p "$ROOT"/backend/app/core
+mkdir -p "$ROOT"/backend/app/utils
+mkdir -p "$ROOT"/backend/migrations
+mkdir -p "$ROOT"/backend/tests
+mkdir -p "$ROOT"/frontend
+mkdir -p "$ROOT"/infra/nginx
+mkdir -p "$ROOT"/infra/scripts
+
+# .gitignore básico
+cat > "$ROOT/.gitignore" <<'EOF'
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.env
+.venv/
+.env*
+.mypy_cache/
+.pytest_cache/
+
+# Node/Angular
+node_modules/
+dist/
+.angular/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS
+.DS_Store
+Thumbs.db
+EOF
+
+# README
+cat > "$ROOT/README.md" <<'EOF'
+# Simplifique (Monorepo)
+Backend: Flask (API) | Frontend: Angular
+
+## Dev rápido
+- Backend:
+  ```
+  cd backend
+  python -m venv .venv
+  source .venv/bin/activate  # Windows: .venv\Scripts\Activate.ps1
+  pip install -r requirements.txt
+  export FLASK_APP=app:create_app
+  flask db init || true
+  flask db migrate -m "init" || true
+  flask db upgrade || true
+  flask run --debug
+  ```
+- Frontend:
+  ```
+  cd frontend
+  npm ci
+  npm start
+  ```
+## Docker (db + backend)
+```
+cd infra
+docker compose up -d --build
+```
+EOF
+
+###############################
+# BACKEND (Flask)
+###############################
+cat > "$ROOT/backend/requirements.txt" <<'EOF'
+Flask==3.0.3
+flask-cors==5.0.0
+Flask-JWT-Extended==4.6.0
+Flask-Migrate==4.0.7
+SQLAlchemy==2.0.35
+psycopg2-binary==2.9.9
+marshmallow==3.22.0
+flask-smorest==0.44.0
+python-dotenv==1.0.1
+gunicorn==22.0.0
+EOF
+
+# app/__init__.py
+cat > "$ROOT/backend/app/__init__.py" <<'PY'
+from flask import Flask
+from .core.config import Config
+from .core.extensions import db, migrate, cors, jwt, api
+from .api.v1 import register_v1
+
+def create_app(config_class: type[Config] = Config) -> Flask:
+    app = Flask(__name__)
+    app.config.from_object(config_class)
+
+    db.init_app(app)
+    migrate.init_app(app, db)
+    cors.init_app(app, resources={r"/api/*": {"origins": app.config.get("CORS_ORIGINS", "*")}})
+    jwt.init_app(app)
+    api.init_app(app)  # Swagger em /api/docs
+
+    register_v1(app)
+
+    @app.get("/health")
+    def health():
+        return {"status": "ok"}
+
+    return app
+PY
+
+# core/extensions.py
+cat > "$ROOT/backend/app/core/extensions.py" <<'PY'
+from flask_sqlalchemy import SQLAlchemy
+from flask_migrate import Migrate
+from flask_cors import CORS
+from flask_jwt_extended import JWTManager
+from flask_smorest import Api
+
+db = SQLAlchemy()
+migrate = Migrate()
+cors = CORS()
+jwt = JWTManager()
+api = Api()
+PY
+
+# core/config.py
+cat > "$ROOT/backend/app/core/config.py" <<'PY'
+import os
+
+class Config:
+    SQLALCHEMY_DATABASE_URI = os.getenv(
+        "DATABASE_URL",
+        "postgresql+psycopg2://postgres:postgres@localhost:5432/simplifique",
+    )
+    SQLALCHEMY_TRACK_MODIFICATIONS = False
+    JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "dev-secret-change-me")
+
+    API_TITLE = "Simplifique API"
+    API_VERSION = "v1"
+    OPENAPI_VERSION = "3.0.3"
+    OPENAPI_URL_PREFIX = "/api/docs"
+    OPENAPI_SWAGGER_UI_PATH = "/"
+    OPENAPI_SWAGGER_UI_URL = "https://cdn.jsdelivr.net/npm/swagger-ui-dist/"
+
+    CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:4200").split(",")
+PY
+
+# api/v1/__init__.py
+cat > "$ROOT/backend/app/api/v1/__init__.py" <<'PY'
+from flask import Flask
+from flask_smorest import Blueprint
+from .resources.rewards import blp as rewards_blp
+
+def register_v1(app: Flask):
+    app.register_blueprint(rewards_blp)
+PY
+
+# models/reward.py
+cat > "$ROOT/backend/app/models/reward.py" <<'PY'
+from datetime import datetime
+from ..core.extensions import db
+
+class Reward(db.Model):
+    __tablename__ = "rewards"
+
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(120), nullable=False)
+    points_cost = db.Column(db.Integer, nullable=False)
+    stock = db.Column(db.Integer, default=0)
+    active = db.Column(db.Boolean, default=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+PY
+
+# schemas/reward.py
+cat > "$ROOT/backend/app/api/v1/schemas/reward.py" <<'PY'
+from marshmallow import Schema, fields
+
+class RewardSchema(Schema):
+    id = fields.Int(dump_only=True)
+    name = fields.Str(required=True)
+    points_cost = fields.Int(required=True)
+    stock = fields.Int()
+    active = fields.Bool()
+    created_at = fields.DateTime(dump_only=True)
+PY
+
+# resources/rewards.py
+cat > "$ROOT/backend/app/api/v1/resources/rewards.py" <<'PY'
+from flask.views import MethodView
+from flask_smorest import Blueprint, abort
+from ...core.extensions import db
+from ...models.reward import Reward
+from ..schemas.reward import RewardSchema
+
+blp = Blueprint("rewards", "rewards", url_prefix="/api/v1/rewards", description="Brindes")
+
+@blp.route("/")
+class RewardsList(MethodView):
+    @blp.response(200, RewardSchema(many=True))
+    def get(self):
+        return Reward.query.order_by(Reward.id.desc()).all()
+
+    @blp.arguments(RewardSchema)
+    @blp.response(201, RewardSchema)
+    def post(self, data):
+        reward = Reward(**data)
+        db.session.add(reward)
+        db.session.commit()
+        return reward
+
+@blp.route("/<int:reward_id>")
+class RewardDetail(MethodView):
+    @blp.response(200, RewardSchema)
+    def get(self, reward_id):
+        reward = Reward.query.get(reward_id)
+        if not reward:
+            from flask_smorest import abort
+            abort(404, message="Reward not found")
+        return reward
+PY
+
+# wsgi.py
+cat > "$ROOT/backend/app/wsgi.py" <<'PY'
+from . import create_app
+app = create_app()
+PY
+
+# gunicorn.conf.py
+cat > "$ROOT/backend/gunicorn.conf.py" <<'PY'
+bind = "0.0.0.0:5000"
+workers = 2
+timeout = 120
+wsgi_app = "app.wsgi:app"
+PY
+
+# .env.example
+cat > "$ROOT/backend/.env.example" <<'ENV'
+DATABASE_URL=postgresql+psycopg2://postgres:postgres@localhost:5432/simplifique
+JWT_SECRET_KEY=troque-este-segredo
+CORS_ORIGINS=http://localhost:4200
+ENV
+
+# Dockerfile backend
+cat > "$ROOT/backend/Dockerfile" <<'DOCKER'
+FROM python:3.12-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN apt-get update && apt-get install -y build-essential libpq-dev &&     pip install --no-cache-dir -r requirements.txt &&     apt-get purge -y build-essential && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
+COPY app ./app
+ENV FLASK_APP=app:create_app
+EXPOSE 5000
+CMD ["gunicorn", "-c", "gunicorn.conf.py", "app.wsgi:app"]
+DOCKER
+
+###############################
+# FRONTEND (Angular)
+###############################
+# Tentativa de gerar projeto Angular real, se CLI existir
+if command -v ng >/dev/null 2>&1; then
+  echo ">> Angular CLI detectado. Gerando projeto Angular..."
+  pushd "$ROOT" >/dev/null
+  ng new frontend --routing --style=scss --skip-git --package-manager npm --strict false
+  popd >/dev/null
+
+  # Adiciona serviço RewardsService
+  mkdir -p "$ROOT/frontend/src/app/core/services"
+  cat > "$ROOT/frontend/src/app/core/services/rewards.service.ts" <<'TS'
+import { HttpClient } from '@angular/common/http';
+import { Injectable, inject } from '@angular/core';
+import { environment } from '../../../environments/environment';
+
+export interface Reward {
+  id?: number;
+  name: string;
+  points_cost: number;
+  stock?: number;
+  active?: boolean;
+  created_at?: string;
+}
+
+@Injectable({ providedIn: 'root' })
+export class RewardsService {
+  private http = inject(HttpClient);
+  private base = `${environment.apiBaseUrl}/rewards`;
+
+  list() { return this.http.get<Reward[]>(`${this.base}/`); }
+  create(payload: Reward) { return this.http.post<Reward>(`${this.base}/`, payload); }
+  get(id: number) { return this.http.get<Reward>(`${this.base}/${id}`); }
+}
+TS
+
+  # Atualiza environment com apiBaseUrl
+  if [ -f "$ROOT/frontend/src/environments/environment.ts" ]; then
+    cat > "$ROOT/frontend/src/environments/environment.ts" <<'TS'
+export const environment = {
+  production: false,
+  apiBaseUrl: 'http://localhost:5000/api/v1'
+};
+TS
+  fi
+
+  if [ -f "$ROOT/frontend/src/environments/environment.development.ts" ]; then
+    cat > "$ROOT/frontend/src/environments/environment.development.ts" <<'TS'
+export const environment = {
+  production: false,
+  apiBaseUrl: 'http://localhost:5000/api/v1'
+};
+TS
+  fi
+
+  if [ -f "$ROOT/frontend/src/environments/environment.prod.ts" ]; then
+    cat > "$ROOT/frontend/src/environments/environment.prod.ts" <<'TS'
+export const environment = {
+  production: true,
+  apiBaseUrl: '/api/v1'
+};
+TS
+  fi
+else
+  echo ">> Angular CLI não encontrado. Criando placeholders em frontend/ (instale: npm i -g @angular/cli)"
+  mkdir -p "$ROOT/frontend/src/app"
+  mkdir -p "$ROOT/frontend/src/environments"
+  cat > "$ROOT/frontend/package.json" <<'JSON'
+{
+  "name": "frontend",
+  "version": "0.0.0",
+  "private": true,
+  "scripts": {
+    "start": "echo "Instale @angular/cli e gere o projeto (ng new)." && exit 1",
+    "build": "echo "Instale @angular/cli e gere o projeto (ng new)." && exit 1"
+  }
+}
+JSON
+  cat > "$ROOT/frontend/src/environments/environment.ts" <<'TS'
+export const environment = {
+  production: false,
+  apiBaseUrl: 'http://localhost:5000/api/v1'
+};
+TS
+  cat > "$ROOT/frontend/README.md" <<'EOF'
+# Placeholder do Frontend
+Instale Angular CLI e gere o projeto real:
+  npm i -g @angular/cli
+  cd ..
+  ng new frontend --routing --style=scss --skip-git
+Depois mova/ajuste os serviços conforme necessário.
+EOF
+fi
+
+# Dockerfile frontend (placeholder: build estático futuro)
+cat > "$ROOT/frontend/Dockerfile" <<'DOCKER'
+# Este Dockerfile é um placeholder. Em produção, construa o Angular e sirva via Nginx.
+# Exemplo de estágios:
+# FROM node:20-alpine as build
+# WORKDIR /app
+# COPY package*.json ./
+# RUN npm ci
+# COPY . .
+# RUN npm run build -- --configuration production
+# FROM nginx:alpine
+# COPY --from=build /app/dist/ /usr/share/nginx/html
+# EXPOSE 80
+DOCKER
+
+###############################
+# INFRA (docker-compose + nginx + scripts)
+###############################
+# docker-compose mínimo (db + backend)
+cat > "$ROOT/infra/docker-compose.yml" <<'YAML'
+version: "3.9"
+services:
+  db:
+    image: postgres:14-alpine
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: simplifique
+    volumes:
+      - dbdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  backend:
+    build: ../backend
+    environment:
+      - DATABASE_URL=postgresql+psycopg2://postgres:postgres@db:5432/simplifique
+      - JWT_SECRET_KEY=troque-este-segredo
+      - CORS_ORIGINS=http://localhost:4200
+    depends_on:
+      - db
+    ports:
+      - "5000:5000"
+
+volumes:
+  dbdata:
+YAML
+
+# nginx default (placeholder; ajuste quando for servir frontend buildado)
+cat > "$ROOT/infra/nginx/default.conf" <<'NGINX'
+server {
+  listen 80;
+  root /usr/share/nginx/html;
+  index index.html;
+
+  location / {
+    try_files $uri $uri/ /index.html;
+  }
+
+  location /api/ {
+    proxy_pass http://backend:5000/;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  }
+}
+NGINX
+
+# scripts/dev.sh (dev local)
+cat > "$ROOT/infra/scripts/dev.sh" <<'SH'
+#!/usr/bin/env bash
+set -e
+# Backend
+pushd "$(dirname "$0")/../../backend" >/dev/null
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+export FLASK_APP=app:create_app
+flask db init || true
+flask db migrate -m "init" || true
+flask db upgrade || true
+flask run --debug
+popd >/dev/null
+SH
+chmod +x "$ROOT/infra/scripts/dev.sh"
+
+# scripts/dev.ps1 (Windows)
+cat > "$ROOT/infra/scripts/dev.ps1" <<'PS1'
+# Backend
+Push-Location $PSScriptRoot\..\..ackend
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+$env:FLASK_APP="app:create_app"
+flask db init 2>$null
+flask db migrate -m "init" 2>$null
+flask db upgrade
+flask run --debug
+Pop-Location
+PS1
+
+echo "✅ Estrutura criada em: $ROOT"
+echo
+if command -v ng >/dev/null 2>&1; then
+  echo "Frontend Angular gerado. Próximos passos:"
+  echo "  cd "$PROJECT_NAME"/frontend && npm ci && npm start"
+else
+  echo "Instale Angular CLI para gerar o frontend real:"
+  echo "  npm i -g @angular/cli"
+  echo "  cd "$PROJECT_NAME" && ng new frontend --routing --style=scss --skip-git"
+fi
+
+echo
+echo "Backend:"
+echo "  cd "$PROJECT_NAME"/backend && python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt && export FLASK_APP=app:create_app && flask db upgrade && flask run --debug"
+echo
+
+echo "Docker (db + backend):"
+echo "  cd "$PROJECT_NAME"/infra && docker compose up -d --build"
